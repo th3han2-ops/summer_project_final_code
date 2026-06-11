@@ -1,0 +1,118 @@
+# I used AI to help me write parts of this code, mostly to help me structure the code and to help me plot any figures/graphs
+import numpy as np
+import matplotlib.pyplot as plt
+
+C_WATER = 1480.0 # constant, speed of sound in water [m/s]
+ 
+# Configuration section containing important variables used repeatedly in later code
+class Config: # Near end of script, Config is defined as cfg thats why cfg appears
+    #Also, 'class' is used to avoid having to list each variable one by one,
+    # calling it carries along all the values within config, but can use cfg.(variable name)
+    # if you want to only use that one variable
+    # 2-D box (a slice of the tank), in metres:
+    Lx = 0.12             # width  [m]
+    Ly = 0.07             # height [m]
+ 
+    Pdrive_atm   = 1.7    # peak pressure delivered at the BEST resonance [atm]
+                          # Pdrive_atm brings the model to reality as it converts the arbitrary
+                          # response numbers into atmospheres, yielding pressure values 
+                          # rather than just ratios. This lets us compare against
+                          # the Blake threshold and determine where cavitation actually occurs.
+                          
+    P_threshold  = 1.25   # Blake / cavitation threshold [atm]
+    Q            = 60     # resonance sharpness (higher = sharper peaks)
+ 
+    M_MAX = 8             # highest mode number in x
+    N_MAX = 8             # highest mode number in y
+ 
+    f_lo = 2_000.0        # bottom of the frequency band [Hz]
+    f_hi = 46_000.0       # top of the frequency band    [Hz]
+ 
+
+def mode_frequency(m, n, Lx, Ly):
+    return (C_WATER / 2.0) * np.sqrt((m / Lx) ** 2 + (n / Ly) ** 2) # Resonant frequency formula
+ 
+ 
+def build_modes(cfg):
+    modes = []
+    for m in range(cfg.M_MAX + 1):
+        for n in range(cfg.N_MAX + 1):
+            if m == 0 and n == 0: # Skips (0,0) as 0 half waves in x and 0 half waves in y is meaningless
+                continue
+            f0 = mode_frequency(m, n, cfg.Lx, cfg.Ly)
+            a = 1.0 / (1.0 + m + n) # Coupling between transducer and modes, only approximation --> more accurate way is computing overlap integral but unneccessary complication 
+            modes.append((m, n, f0, a))
+    return modes
+ 
+ 
+def mode_responses(f, cfg, modes):
+    r = {}
+    for (m, n, f0, a) in modes:
+        gamma = f0 / cfg.Q # width of resonance peak    
+        denom = np.sqrt((f0 ** 2 - f ** 2) ** 2 + (gamma * f) ** 2) # denominator of amplitude response equation for a damped, driven harmonic oscillator
+        r[(m, n)] = a * f0 ** 2 / denom # numerator of amplitude response equation/denominator (split up so there isn't one really long line)
+    return r # r gives how strongly each mode is responding at the driving frequency
+             # these are summed later in pressure field section and act as mixing weights that
+             # control how much each mode's spatial pattern contributes in the final standing wave
+
+
+def response_scalar(f, cfg, modes):
+    return max(mode_responses(f, cfg, modes).values())                                          
+# This block of code collapses the 80 individual mode responses to give the value relating to 
+# the strongest response. This is so we have a single number at each frequency that can be compared 
+# against the reference maximum, letting us convert arbitrary response values into real pressure 
+# in atmospheres
+
+
+def reference_response(cfg, modes):
+    fs = np.linspace(cfg.f_lo, cfg.f_hi, 1500)
+    return max(response_scalar(f, cfg, modes) for f in fs)
+# This block scans 1500 frequencies across the band, gets the strongest mode
+# response at each one, then picks the single biggest value overall.
+# This is the best resonance the box can produce, 
+# which we set equal to Pdrive_atm when converting to real pressure.
+ 
+ 
+# COMPUTING PRESSURE FIELD HERE
+def pressure_field(f, cfg, modes, aref, nx=240, ny=140): # note that aref is defined later in the 
+# plotting section. aref is the overall biggest value found from reference_response.
+# nx and ny are number of grid points in x and y directions - 240 and 140 are enough to look
+# smooth, but can be varied if need be. 
+
+    u = np.linspace(0, 1, nx) # 0 is left wall, 1 is right wall
+    v = np.linspace(0, 1, ny) # 0 is bottom wall, 1 is top wall
+    U, V = np.meshgrid(u, v) # Turns the two 1-D lists into two 2-D grids. 
+    # U is a 140 × 240 array where every point knows its x-position. V is a 140 × 240 array where 
+    # every point knows its y-position. Together they give the coordinates of all 33,600 grid points.
+    
+ 
+    r = mode_responses(f, cfg, modes)
+    S = np.zeros_like(U) # Creates a blank 140 × 240 grid, filled with zeros. 
+    # This is where we put the standing wave onto. zeros_like(U) creates array with same shape as U,
+    # made up of all zeros.
+    
+    for (m, n, f0, a) in modes:
+        S += r[(m, n)] * np.cos(m * np.pi * U) * np.cos(n * np.pi * V)
+        # np.cos(m * np.pi * U) computes the x-direction pattern for mode (m,n) at every grid point
+        # simultaneously, and np.cos(n * np.pi * V) does the same thing in y-direction. Multiplying
+        # these together gives the full 2-D spatial pattern for each mode. r[(m, n)] then 
+        # multiplies this pattern by how strongly the mode is responding. S += keeps a running total,
+        # so S contains the superposition of all 80 weighted patterns. Remember that near resonance
+        # S looks like the corresponding mode only as its weight dominates, whereas between
+        # resonances S will look messy because many modes contribute similarly.
+        
+    
+ 
+    Smax = np.max(np.abs(S)) # finds largest value in the pattern
+    Ppeak = cfg.Pdrive_atm * response_scalar(f, cfg, modes) / aref # converts to real pressure,
+    # gives peak pressure that strongest point in box reaches at the drive frequency selected
+    
+    field = Ppeak * S / Smax if Smax > 0 else S # S/Smax squashes shape to make peak at 1,
+    # then multiplying by Ppeak stretches it so peak is real pressure,
+    # (basically normalised first, then Ppeak stamps the real scale on).
+ 
+    X = U * cfg.Lx * 100.0 # * 100 converts to cm                         
+    Y = V * cfg.Ly * 100.0
+    return X, Y, field, Ppeak
+ 
+ 
